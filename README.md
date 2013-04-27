@@ -1,0 +1,4 @@
+javanicus
+=========
+
+WebHDFS FUSE driver
