@@ -16,6 +16,7 @@ https://github.com/terencehonles/fusepy
 
 # TODO - error handling pass
 # TODO - fix user/group <-> uid/gid
+# TODO - auth!
 
 import errno
 import stat
@@ -78,22 +79,26 @@ class Javanicus(fuse.Operations, fuse.LoggingMixIn):
                                         [&permission=<OCTAL>]
                                         [&buffersize=<INT>]
 
-        <server responds with a redirect>
+        <namenode responds with a redirect to a datanode>
         HTTP/1.1 307 TEMPORARY_REDIRECT
         Location: http://<DATANODE>:<PORT>/webhdfs/v1/<PATH>?op=CREATE...
         Content-Length: 0
 
-        <put to datanode with file contents...do we need to do this?>
+        <put to datanode with empty file contents...do we need to do this?>
         PUT /webhdfs/v1/<PATH>?op=CREATE...
 
-        <server responds with 201 created>
+        <datanode responds with 201 created>
         HTTP/1.1 201 Created
         Location: webhdfs://<HOST>:<PORT>/<PATH>
         Content-Length: 0
         '''
-        response = self.session.put(self._url(path), params={'op': 'CREATE',
-                                                             'mode': oct(mode)})
-        response.raise_for_status()
+        s1_response = self.session.put(self._url(path), params={'op': 'CREATE',
+                                                                'mode': oct(mode)})
+        s1_response.raise_for_status()
+        s2_url = s1_response.headers['location']
+        s2_response = self.session.put(s2_url, params={'op': 'CREATE',
+                                                       'mode': oct(mode)})
+        s2_response.raise_for_status()
         return 0
 
 
@@ -132,7 +137,17 @@ class Javanicus(fuse.Operations, fuse.LoggingMixIn):
 
 
     def read(self, path, size, offset, fh):
-        pass
+        '''
+        GET /webhdfs/v1/<PATH>?op=OPEN[&offset=<LONG>][&length=<LONG>][&buffersize=<INT>]
+
+        <namenode redirects to datanode, requests will auto-follow>
+        '''
+        response = self.session.get(self._url(path), params={'op': 'OPEN',
+                                                             'offset': offset,
+                                                             'length': size})
+        response.raise_for_status()
+        # TODO - sanity check the response size vs. requested size?
+        return response.content
 
 
     def readdir(self, path, fh):
@@ -148,7 +163,13 @@ class Javanicus(fuse.Operations, fuse.LoggingMixIn):
 
 
     def rename(self, old, new):
-        pass
+        '''
+        PUT /webhdfs/v1/<PATH>?op=RENAME&destination=<PATH>
+        '''
+        response = self.session.put(self._url(old), params={'op': 'RENAME',
+                                                            'destination': new})
+        response.raise_for_status()
+        return 0 if response.json()['boolean'] else -errno.EREMOTEIO
 
 
     def rmdir(self, path):
@@ -161,10 +182,22 @@ class Javanicus(fuse.Operations, fuse.LoggingMixIn):
 
 
     def symlink(self, target, source):
-        pass
+        '''
+        PUT /webhdfs/v1/<PATH>?op=CREATESYMLINK&destination=<PATH>[&createParent=<true|false>]
+        '''
+        response = self.session.put(self._url(source), params={'op': 'CREATESYMLINK',
+                                                               'destination': target})
+        response.raise_for_status()
+        return 0
 
 
     def truncate(self, path, length, fh=None):
+        '''
+        like create, but actually send the file data
+
+        do i need to copy the original down, truncate it, then upload it?
+        i hope not.
+        '''
         pass
 
 
@@ -178,16 +211,20 @@ class Javanicus(fuse.Operations, fuse.LoggingMixIn):
 
 
     def write(self, path, data, offset, fh):
+        '''
+        like create, but actually send the file data
+
+        do i need to copy the original down, patch it, then upload it?
+        i hope not.
+        '''
         pass
-
-
-
 
 
 if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument('url')
+    parser.add_argument('host')
+    parser.add_argument('port')
     parser.add_argument('mountpoint')
     args = parser.parse_args
 
