@@ -37,7 +37,7 @@ class Javanicus(fuse.Operations, fuse.LoggingMixIn):
     def __init__(self, host, port, path='.'):
         self.host = host
         self.port = port
-        self.base_url = 'http://{}:{}/webhdfs/v1/'.format(self.host, self.port)
+        self.base_url = 'http://%s:%s/webhdfs/v1/' % (self.host, self.port)
         self.root = path
         self.session = requests.session()
         self.context = dict(zip(('uid', 'gid', 'pid'), fuse.fuse_get_context()))
