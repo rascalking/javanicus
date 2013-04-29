@@ -43,7 +43,7 @@ class Javanicus(fuse.Operations, fuse.LoggingMixIn):
         self.context = dict(zip(('uid', 'gid', 'pid'), fuse.fuse_get_context()))
 
 
-    def _url(path):
+    def _url(self, path):
         # strip the leading / to please urljoin
         return urlparse.urljoin(self.base_url, path.lstrip('/'))
 
@@ -111,17 +111,20 @@ class Javanicus(fuse.Operations, fuse.LoggingMixIn):
         GET /webhdfs/v1/<PATH>?op=GETFILESTATUS
         '''
         response = self.session.get(self._url(path), params={'op': 'GETFILESTATUS'})
-        response.raise_for_status()
+	try:
+            response.raise_for_status()
+        except Exception as e:
+            import pdb; pdb.set_trace()
         hdfs_status = response.json()['FileStatus']
         status = {
             'st_atime': hdfs_status['accessTime'],
-            'st_gid': hdfs_status['group'],
+            'st_gid': 0, # hdfs_status['group'],
             'st_mode': (int(hdfs_status['permission'], 8)
                         | self.MODE_FLAGS[hdfs_status['type']]),
             'st_mtime': hdfs_status['modificationTime'],
-            'st_size': hdfs_stats['length'],
+            'st_size': hdfs_status['length'],
+            'st_uid': 0, # hdfs_status['user'],
         }
-        if stat.S_
 
         return status
 
@@ -226,7 +229,7 @@ if __name__ == '__main__':
     parser.add_argument('host')
     parser.add_argument('port')
     parser.add_argument('mountpoint')
-    args = parser.parse_args
+    args = parser.parse_args()
 
-    fs = fuse.FUSE(Javanicus(args.url), args.mountpoint,
+    fs = fuse.FUSE(Javanicus(args.host, args.port), args.mountpoint,
                    foreground=True, nothreads=True)
