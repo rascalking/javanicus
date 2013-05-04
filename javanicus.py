@@ -32,10 +32,12 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 '''
 
 # TODO - error handling pass
-# TODO - fix user/group <-> uid/gid
+# TODO - memoize uid/gid/user/group lookups
 # TODO - auth!
 
 import errno
+import grp
+import pwd
 import stat
 import urlparse
 
@@ -51,26 +53,55 @@ class Javanicus(fuse.Operations, fuse.LoggingMixIn):
     }
 
 
-    def __init__(self, host, port, path='.'):
-        self.host = host
-        self.port = port
-        self.base_url = 'http://%s:%s/webhdfs/v1/' % (self.host, self.port)
-        self.root = path
-        self.session = requests.session()
-        self.context = dict(zip(('uid', 'gid', 'pid'), fuse.fuse_get_context()))
+    def __init__(self, host, port, mountpoint='.'):
+        self._host = host
+        self._port = port
+        self._mountpoint = mountpoint
+
+        self._base_url = 'http://%s:%s/webhdfs/v1/' % (self._host, self._port)
+        self._session = requests.session()
 
 
     def _url(self, path):
         # strip the leading / to please urljoin
-        return urlparse.urljoin(self.base_url, path.lstrip('/'))
+        return urlparse.urljoin(self._base_url, path.lstrip('/'))
+
+
+    def _gid(self, group):
+        try:
+            return grp.getgrnam(group).gr_gid
+        except KeyError:
+            return 0
+
+
+    def _group(self, gid):
+        try:
+            return grp.getgrgid(gid).gr_name
+        except KeyError:
+            return 'root'
+
+
+    def _uid(self, username):
+        try:
+            return pwd.getpwnam(username).pw_uid
+        except KeyError:
+            return 0
+
+
+    def _user(self, uid):
+        try:
+            return pwd.getpwuid(uid).pw_name
+        except KeyError:
+            return 'root'
 
 
     def chmod(self, path, mode):
         '''
         PUT /webhdfs/v1/<PATH>?op=SETPERMISSION[&permission=<OCTAL>]
         '''
-        response = self.session.put(self._url(path), params={'op': 'SETPERMISSION',
-                                                             'permission': oct(mode)})
+        response = self._session.put(self._url(path),
+                                    params={'op': 'SETPERMISSION',
+                                            'permission': oct(mode)})
         response.raise_for_status()
         return 0
 
@@ -79,9 +110,11 @@ class Javanicus(fuse.Operations, fuse.LoggingMixIn):
         '''
         PUT /webhdfs/v1/<PATH>?op=SETOWNER[&user=<USER>][&group=<GROUP>]
         '''
-        response = self.session.put(self._url(path), params={'op': 'SETOWNER',
-                                                             'user': uid,
-                                                             'group': gid})
+        user = self._user(uid)
+        group = self._group(gid)
+        response = self._session.put(self._url(path), params={'op': 'SETOWNER',
+                                                             'user': user,
+                                                             'group': group})
         response.raise_for_status()
         return 0
 
@@ -109,38 +142,49 @@ class Javanicus(fuse.Operations, fuse.LoggingMixIn):
         Location: webhdfs://<HOST>:<PORT>/<PATH>
         Content-Length: 0
         '''
-        s1_response = self.session.put(self._url(path), params={'op': 'CREATE',
-                                                                'mode': oct(mode)})
+        s1_response = self._session.put(self._url(path),
+                                       params={'op': 'CREATE',
+                                               'mode': oct(mode)})
         s1_response.raise_for_status()
         s2_url = s1_response.headers['location']
-        s2_response = self.session.put(s2_url, params={'op': 'CREATE',
+        s2_response = self._session.put(s2_url, params={'op': 'CREATE',
                                                        'mode': oct(mode)})
         s2_response.raise_for_status()
         return 0
 
 
     def destroy(self, path):
-        self.session.close()
+        self._session.close()
 
 
     def getattr(self, path, fh=None):
         '''
         GET /webhdfs/v1/<PATH>?op=GETFILESTATUS
         '''
-        response = self.session.get(self._url(path), params={'op': 'GETFILESTATUS'})
+        response = self._session.get(self._url(path),
+                                    params={'op': 'GETFILESTATUS'})
 	try:
             response.raise_for_status()
+        except requests.HTTPError as e:
+            if e.response.status_code == requests.codes.not_found:
+                raise fuse.FuseOSError(errno.ENOENT)
+            else:
+                import ipdb; ipdb.set_trace()
+                raise
         except Exception as e:
-            import pdb; pdb.set_trace()
+            import ipdb; ipdb.set_trace()
+            raise
         hdfs_status = response.json()['FileStatus']
+        # NB - timestamps in hdfs_status are milliseconds since epoch,
+        #      and timestamps in status need to be seconds since epoch
         status = {
-            'st_atime': hdfs_status['accessTime'],
-            'st_gid': 0, # hdfs_status['group'],
+            'st_atime': hdfs_status['accessTime'] / float(1000),
+            'st_gid': self._gid(hdfs_status['group']),
             'st_mode': (int(hdfs_status['permission'], 8)
                         | self.MODE_FLAGS[hdfs_status['type']]),
-            'st_mtime': hdfs_status['modificationTime'],
+            'st_mtime': hdfs_status['modificationTime'] / float(1000),
             'st_size': hdfs_status['length'],
-            'st_uid': 0, # hdfs_status['user'],
+            'st_uid': self._uid(hdfs_status['owner']),
         }
 
         return status
@@ -150,19 +194,23 @@ class Javanicus(fuse.Operations, fuse.LoggingMixIn):
         '''
         PUT /webhdfs/v1/<PATH>?op=MKDIRS[&permission=<OCTAL>]
         '''
-        response = self.session.put(self._url(path), params={'op': 'MKDIRS',
-                                                             'permission': permission})
+        response = self._session.put(self._url(path),
+                                    params={'op': 'MKDIRS',
+                                            'permission': permission})
         response.raise_for_status()
-        return 0 if response.json()['boolean'] else -errno.EREMOTEIO
+        if not response.json()['boolean']:
+            raise fuse.FuseOSError(errno.EREMOTEIO)
+        return 0
 
 
     def read(self, path, size, offset, fh):
         '''
-        GET /webhdfs/v1/<PATH>?op=OPEN[&offset=<LONG>][&length=<LONG>][&buffersize=<INT>]
+        GET /webhdfs/v1/<PATH>?op=OPEN[&offset=<LONG>][&length=<LONG>]
+                                      [&buffersize=<INT>]
 
         <namenode redirects to datanode, requests will auto-follow>
         '''
-        response = self.session.get(self._url(path), params={'op': 'OPEN',
+        response = self._session.get(self._url(path), params={'op': 'OPEN',
                                                              'offset': offset,
                                                              'length': size})
         response.raise_for_status()
@@ -174,7 +222,8 @@ class Javanicus(fuse.Operations, fuse.LoggingMixIn):
         '''
         GET /webhdfs/v1/<PATH>?op=LISTSTATUS
         '''
-        response = self.session.get(self._url(path), params={'op': 'LISTSTATUS'})
+        response = self._session.get(self._url(path),
+                                    params={'op': 'LISTSTATUS'})
         response.raise_for_status()
         dir_contents = ['.', '..']
         for status in response.json()['FileStatuses']['FileStatus']:
@@ -186,28 +235,39 @@ class Javanicus(fuse.Operations, fuse.LoggingMixIn):
         '''
         PUT /webhdfs/v1/<PATH>?op=RENAME&destination=<PATH>
         '''
-        response = self.session.put(self._url(old), params={'op': 'RENAME',
+        response = self._session.put(self._url(old), params={'op': 'RENAME',
                                                             'destination': new})
         response.raise_for_status()
-        return 0 if response.json()['boolean'] else -errno.EREMOTEIO
+        if not response.json()['boolean']:
+            raise fuse.FuseOSError(errno.EREMOTEIO)
+        return 0
+
 
 
     def rmdir(self, path):
         '''
         DELETE /webhdfs/v1/<path>?op=DELETE[&recursive=<true|false>]
         '''
-        response = self.session.delete(self._url(path), params={'op': 'DELETE'})
+        response = self._session.delete(self._url(path), params={'op': 'DELETE'})
         response.raise_for_status()
-        return 0 if response.json()['boolean'] else -errno.EREMOTEIO
+        if not response.json()['boolean']:
+            raise fuse.FuseOSError(errno.EREMOTEIO)
+        return 0
 
 
     def symlink(self, target, source):
         '''
-        PUT /webhdfs/v1/<PATH>?op=CREATESYMLINK&destination=<PATH>[&createParent=<true|false>]
+        PUT /webhdfs/v1/<PATH>?op=CREATESYMLINK&destination=<PATH>
+                               [&createParent=<true|false>]
         '''
-        response = self.session.put(self._url(source), params={'op': 'CREATESYMLINK',
-                                                               'destination': target})
-        response.raise_for_status()
+        import ipdb; ipdb.set_trace()
+        response = self._session.put(self._url(target),
+                                    params={'op': 'CREATESYMLINK',
+                                            'destination': source})
+        try:
+            response.raise_for_status()
+        except Exception as e:
+            import ipdb; ipdb.set_trace()
         return 0
 
 
@@ -225,9 +285,11 @@ class Javanicus(fuse.Operations, fuse.LoggingMixIn):
         '''
         DELETE /webhdfs/v1/<path>?op=DELETE[&recursive=<true|false>]
         '''
-        response = self.session.delete(self._url(path), params={'op': 'DELETE'})
+        response = self._session.delete(self._url(path), params={'op': 'DELETE'})
         response.raise_for_status()
-        return 0 if response.json()['boolean'] else -errno.EREMOTEIO
+        if not response.json()['boolean']:
+            raise fuse.FuseOSError(errno.EREMOTEIO)
+        return 0
 
 
     def write(self, path, data, offset, fh):
@@ -248,5 +310,6 @@ if __name__ == '__main__':
     parser.add_argument('mountpoint')
     args = parser.parse_args()
 
-    fs = fuse.FUSE(Javanicus(args.host, args.port), args.mountpoint,
+    fs = fuse.FUSE(Javanicus(args.host, args.port, args.mountpoint),
+                   args.mountpoint,
                    foreground=True, nothreads=True)
