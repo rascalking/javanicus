@@ -31,12 +31,11 @@ You should have received a copy of the GNU General Public License
 along with this program.  If not, see <http://www.gnu.org/licenses/>.
 '''
 
-# TODO - error handling pass
-# TODO - memoize uid/gid/user/group lookups
-# TODO - auth!
 
 import errno
 import grp
+import logging
+import os
 import pwd
 import stat
 import urlparse
@@ -45,7 +44,7 @@ import fuse
 import requests
 
 
-class Javanicus(fuse.Operations, fuse.LoggingMixIn):
+class Javanicus(fuse.Operations):
     MODE_FLAGS = {
         'DIRECTORY': stat.S_IFDIR,
         'FILE': stat.S_IFREG,
@@ -53,13 +52,21 @@ class Javanicus(fuse.Operations, fuse.LoggingMixIn):
     }
 
 
-    def __init__(self, host, port, mountpoint='.'):
+    def __init__(self, host, port, mountpoint='.', debug=True):
+        self._logger = logging.getLogger(self.__class__.__name__)
+        self._logger.setLevel(logging.DEBUG if debug else logging.INFO)
+
         self._host = host
         self._port = port
-        self._mountpoint = mountpoint
+        self._mountpoint = os.path.abspath(mountpoint).rstrip('/')
 
         self._base_url = 'http://%s:%s/webhdfs/v1/' % (self._host, self._port)
         self._session = requests.session()
+
+
+    def __call__(self, *args, **kwargs):
+        self._logger.debug('%s %s', args, kwargs)
+        return super(Javanicus, self).__call__(*args, **kwargs)
 
 
     def _url(self, path):
@@ -95,14 +102,33 @@ class Javanicus(fuse.Operations, fuse.LoggingMixIn):
             return 'root'
 
 
+    @property
+    def _current_user(self):
+        uid = fuse.fuse_get_context()[0]
+        return self._user(uid)
+
+
+    def _raise_and_log_for_status(self, response):
+        try:
+            response.raise_for_status()
+        except requests.HTTPError as e:
+            self._logger.warn('\n%s %s\n\n%s\n%s',
+                              response.request.method,
+                              response.request.url,
+                              e,
+                              response.text) 
+            raise
+
+
     def chmod(self, path, mode):
         '''
         PUT /webhdfs/v1/<PATH>?op=SETPERMISSION[&permission=<OCTAL>]
         '''
         response = self._session.put(self._url(path),
                                     params={'op': 'SETPERMISSION',
-                                            'permission': oct(mode)})
-        response.raise_for_status()
+                                            'permission': oct(mode),
+                                            'user.name': self._current_user})
+        self._raise_and_log_for_status(response)
         return 0
 
 
@@ -112,10 +138,12 @@ class Javanicus(fuse.Operations, fuse.LoggingMixIn):
         '''
         user = self._user(uid)
         group = self._group(gid)
-        response = self._session.put(self._url(path), params={'op': 'SETOWNER',
-                                                             'user': user,
-                                                             'group': group})
-        response.raise_for_status()
+        response = self._session.put(self._url(path),
+                                     params={'op': 'SETOWNER',
+                                             'user.name': self._current_user,
+                                             'user': user,
+                                             'group': group})
+        self._raise_and_log_for_status(response)
         return 0
 
 
@@ -129,27 +157,16 @@ class Javanicus(fuse.Operations, fuse.LoggingMixIn):
                                         [&permission=<OCTAL>]
                                         [&buffersize=<INT>]
 
-        <namenode responds with a redirect to a datanode>
+        <namenode responds with a redirect to a datanode, which we ignore>
         HTTP/1.1 307 TEMPORARY_REDIRECT
         Location: http://<DATANODE>:<PORT>/webhdfs/v1/<PATH>?op=CREATE...
         Content-Length: 0
-
-        <put to datanode with empty file contents...do we need to do this?>
-        PUT /webhdfs/v1/<PATH>?op=CREATE...
-
-        <datanode responds with 201 created>
-        HTTP/1.1 201 Created
-        Location: webhdfs://<HOST>:<PORT>/<PATH>
-        Content-Length: 0
         '''
-        s1_response = self._session.put(self._url(path),
-                                       params={'op': 'CREATE',
-                                               'mode': oct(mode)})
-        s1_response.raise_for_status()
-        s2_url = s1_response.headers['location']
-        s2_response = self._session.put(s2_url, params={'op': 'CREATE',
-                                                       'mode': oct(mode)})
-        s2_response.raise_for_status()
+        response = self._session.put(self._url(path),
+                                     params={'op': 'CREATE',
+                                             'user.name': self._current_user,
+                                             'mode': oct(mode)})
+        self._raise_and_log_for_status(response)
         return 0
 
 
@@ -164,11 +181,12 @@ class Javanicus(fuse.Operations, fuse.LoggingMixIn):
         response = self._session.get(self._url(path),
                                     params={'op': 'GETFILESTATUS'})
 	try:
-            response.raise_for_status()
+            self._raise_and_log_for_status(response)
         except requests.HTTPError as e:
             if e.response.status_code == requests.codes.not_found:
                 raise fuse.FuseOSError(errno.ENOENT)
             else:
+                print e.response.request.method, e.response.request.url
                 import ipdb; ipdb.set_trace()
                 raise
         except Exception as e:
@@ -197,7 +215,7 @@ class Javanicus(fuse.Operations, fuse.LoggingMixIn):
         response = self._session.put(self._url(path),
                                     params={'op': 'MKDIRS',
                                             'permission': permission})
-        response.raise_for_status()
+        self._raise_and_log_for_status(response)
         if not response.json()['boolean']:
             raise fuse.FuseOSError(errno.EREMOTEIO)
         return 0
@@ -211,9 +229,9 @@ class Javanicus(fuse.Operations, fuse.LoggingMixIn):
         <namenode redirects to datanode, requests will auto-follow>
         '''
         response = self._session.get(self._url(path), params={'op': 'OPEN',
-                                                             'offset': offset,
-                                                             'length': size})
-        response.raise_for_status()
+                                                              'offset': offset,
+                                                              'length': size})
+        self._raise_and_log_for_status(response)
         # TODO - sanity check the response size vs. requested size?
         return response.content
 
@@ -224,7 +242,7 @@ class Javanicus(fuse.Operations, fuse.LoggingMixIn):
         '''
         response = self._session.get(self._url(path),
                                     params={'op': 'LISTSTATUS'})
-        response.raise_for_status()
+        self._raise_and_log_for_status(response)
         dir_contents = ['.', '..']
         for status in response.json()['FileStatuses']['FileStatus']:
             dir_contents.append(status['pathSuffix'])
@@ -237,7 +255,7 @@ class Javanicus(fuse.Operations, fuse.LoggingMixIn):
         '''
         response = self._session.put(self._url(old), params={'op': 'RENAME',
                                                             'destination': new})
-        response.raise_for_status()
+        self._raise_and_log_for_status(response)
         if not response.json()['boolean']:
             raise fuse.FuseOSError(errno.EREMOTEIO)
         return 0
@@ -249,44 +267,37 @@ class Javanicus(fuse.Operations, fuse.LoggingMixIn):
         DELETE /webhdfs/v1/<path>?op=DELETE[&recursive=<true|false>]
         '''
         response = self._session.delete(self._url(path), params={'op': 'DELETE'})
-        response.raise_for_status()
+        self._raise_and_log_for_status(response)
         if not response.json()['boolean']:
             raise fuse.FuseOSError(errno.EREMOTEIO)
         return 0
 
 
-    def symlink(self, target, source):
-        '''
-        PUT /webhdfs/v1/<PATH>?op=CREATESYMLINK&destination=<PATH>
-                               [&createParent=<true|false>]
-        '''
-        import ipdb; ipdb.set_trace()
-        response = self._session.put(self._url(target),
-                                    params={'op': 'CREATESYMLINK',
-                                            'destination': source})
-        try:
-            response.raise_for_status()
-        except Exception as e:
-            import ipdb; ipdb.set_trace()
-        return 0
-
-
     def truncate(self, path, length, fh=None):
-        '''
-        like create, but actually send the file data
-
-        do i need to copy the original down, truncate it, then upload it?
-        i hope not.
-        '''
-        pass
+        if length == 0:
+            self._logger.debug('truncate -> getattr')
+            mode = stat.S_IMODE(self.getattr(path, fh)['st_mode'])
+            self._logger.debug('truncate -> create')
+            response = self._session.put(
+                           self._url(path),
+                           params={'op': 'CREATE',
+                                   'user.name': self._current_user,
+                                   'mode': oct(mode),
+                                   'overwrite': 'true'})
+            self._raise_and_log_for_status(response)
+            return self.create(path, mode)
+        else:
+            raise FuseOSError(errno.EROFS)
 
 
     def unlink(self, path):
         '''
         DELETE /webhdfs/v1/<path>?op=DELETE[&recursive=<true|false>]
         '''
-        response = self._session.delete(self._url(path), params={'op': 'DELETE'})
-        response.raise_for_status()
+        response = self._session.delete(self._url(path),
+                                        params={'op': 'DELETE',
+                                                'user.name': self._current_user})
+        self._raise_and_log_for_status(response)
         if not response.json()['boolean']:
             raise fuse.FuseOSError(errno.EREMOTEIO)
         return 0
@@ -294,15 +305,56 @@ class Javanicus(fuse.Operations, fuse.LoggingMixIn):
 
     def write(self, path, data, offset, fh):
         '''
-        like create, but actually send the file data
+        <put to namenode, don't auto-follow the redirect>
 
-        do i need to copy the original down, patch it, then upload it?
-        i hope not.
+        PUT /webhdfs/v1/<PATH>?op=CREATE[&overwrite=<true|false>]
+                                        [&blocksize=<LONG>]
+                                        [&replication=<SHORT>]
+                                        [&permission=<OCTAL>]
+                                        [&buffersize=<INT>]
+
+        <namenode responds with a redirect to a datanode>
+        HTTP/1.1 307 TEMPORARY_REDIRECT
+        Location: http://<DATANODE>:<PORT>/webhdfs/v1/<PATH>?op=CREATE...
+        Content-Length: 0
+
+        <put to datanode with empty file contents...do we need to do this?>
+        PUT /webhdfs/v1/<PATH>?op=CREATE...
+
+        <datanode responds with 201 created>
+        HTTP/1.1 201 Created
+        Location: webhdfs://<HOST>:<PORT>/<PATH>
+        Content-Length: 0
         '''
-        pass
+        '''
+        There's no way to write specific byte ranges to a file in the webhdfs
+        api.  So, we use a couple different approaches.
+
+        If the offset < the current size, we have to get the whole file (in
+        memory for now, should pick a threshold where we write it to a temp
+        file), patch it locally, then write the whole goddamned thing back up.
+
+        If the offset == the current size, we can just use append.
+
+        If the offset > the current size, we pad it out with zeroes,
+        then use append.
+        '''
+        s1_response = self._session.put(self._url(path),
+                                        params={'op': 'CREATE',
+                                                'user.name': self._current_user})
+        self._raise_and_log_for_status(s1_response)
+        s2_url = s1_response.headers['location'].replace('webhdfs:', 'http:')
+        s2_response = self._session.put(s2_url,
+                                        params={'op': 'CREATE',
+                                                'user.name': self._current_user})
+        self._raise_and_log_for_status(s2_response)
+        return 0
 
 
 if __name__ == '__main__':
+    import logging
+    logging.basicConfig()
+
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument('host')
