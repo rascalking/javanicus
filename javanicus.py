@@ -305,6 +305,34 @@ class Javanicus(fuse.Operations):
 
     def write(self, path, data, offset, fh):
         '''
+        There's no way to write specific byte ranges to a file in the webhdfs
+        api.  So, we use a couple different approaches.
+
+        If the offset < the current size, we have to get the whole file (in
+        memory for now, should pick a threshold where we write it to a temp
+        file), patch it locally, then write the whole goddamned thing back up.
+
+        If the offset == the current size, we can just use append.
+
+        If the offset > the current size, we pad it out with zeroes,
+        then use append.
+        '''
+        current_size = self.getattr(path)['st_size']
+        if offset > current_size:
+            zeroes = '\0' * offset
+            self._write_file(path, zeroes, append=True)
+            self._write_file(path, data, append=True)
+        elif offset == current_size:
+            self._write_file(path, data, append=True)
+        else: # offset < current_size
+            # get file
+            contents[offset:offset+len(data)] = data
+            self._write_file(path, contents)
+        return self._write_file(path, data)
+
+
+    def _write_file(self, path, data, append=False):
+        '''
         <put to namenode, don't auto-follow the redirect>
 
         PUT /webhdfs/v1/<PATH>?op=CREATE[&overwrite=<true|false>]
@@ -325,30 +353,29 @@ class Javanicus(fuse.Operations):
         HTTP/1.1 201 Created
         Location: webhdfs://<HOST>:<PORT>/<PATH>
         Content-Length: 0
-        '''
-        '''
-        There's no way to write specific byte ranges to a file in the webhdfs
-        api.  So, we use a couple different approaches.
 
-        If the offset < the current size, we have to get the whole file (in
-        memory for now, should pick a threshold where we write it to a temp
-        file), patch it locally, then write the whole goddamned thing back up.
-
-        If the offset == the current size, we can just use append.
-
-        If the offset > the current size, we pad it out with zeroes,
-        then use append.
         '''
-        s1_response = self._session.put(self._url(path),
-                                        params={'op': 'CREATE',
-                                                'user.name': self._current_user})
+        # append is the same flow as write, but POST with op=APPEND
+        method = self._session.post if append else self._session.put
+        op = 'APPEND' if append else 'CREATE'
+        overwrite = 'false' if append else 'true'
+
+        s1_response = method(self._url(path),
+                             params={'op': op,
+                                     'user.name': self._current_user,
+                                     'overwrite': overwrite},
+                             allow_redirects=False)
         self._raise_and_log_for_status(s1_response)
+        if 'location' not in s1_response.headers:
+            raise fuse.FuseOSError(errno.EIO)
         s2_url = s1_response.headers['location'].replace('webhdfs:', 'http:')
-        s2_response = self._session.put(s2_url,
-                                        params={'op': 'CREATE',
-                                                'user.name': self._current_user})
+        s2_response = method(s2_url,
+                             params={'op': op,
+                                     'user.name': self._current_user,
+                                     'overwrite': overwrite},
+                             data=data)
         self._raise_and_log_for_status(s2_response)
-        return 0
+        return len(data)
 
 
 if __name__ == '__main__':
