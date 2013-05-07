@@ -39,6 +39,7 @@ import os
 import pwd
 import shutil
 import stat
+import urllib
 import urlparse
 
 import fuse
@@ -72,6 +73,7 @@ class WebHDFS(object):
             if e.response.status_code == requests.codes.not_found:
                 raise WebHDFS.WebHDFSFileNotFoundError(response.request.url)
             else:
+                import ipdb; ipdb.set_trace()
                 self._logger.warn('\n%s\n\n%s\n%s',
                                   request_line, e, response.text)
                 raise WebHDFS.WebHDFSError('%s returned %s: %s'
@@ -89,7 +91,7 @@ class WebHDFS(object):
         self._session = None
 
 
-    def create(self, path, mode, user=None):
+    def create(self, path, permissions, user=None):
         '''
         <put to namenode, don't auto-follow the redirect>
 
@@ -105,12 +107,13 @@ class WebHDFS(object):
         Content-Length: 0
         '''
         params = {'op': 'CREATE',
-                  'permission': oct(int(mode))}
+                  'permission': oct(int(permissions))}
         if user is not None:
             params['user.name'] = user
 
         response = self._session.put(self._url(path), params=params)
         self._raise_and_log_for_status(response)
+        return 0
 
 
     def delete(self, path, recursive=False, user=None):
@@ -207,9 +210,9 @@ class WebHDFS(object):
 
         if 'location' not in s1_response.headers:
             raise fuse.FuseOSError(errno.EIO)
-        s2_url = s1_response.headers['location'].replace('webhdfs:', 'http:')
+        s2_url = s1_response.headers['location']
 
-        s2_response = self._session.put(s2_url, params=params, data=data)
+        s2_response = self._session.put(s2_url, data=data)
         self._raise_and_log_for_status(s2_response)
         return len(data)
 
@@ -242,8 +245,21 @@ class Javanicus(fuse.Operations):
 
     def _tmp_path(self, path):
         tmp_path = os.path.join(self.TMPDIR, path.lstrip('/'))
-        os.makedirs(os.path.dirname(tmp_path))
+        tmp_path_dirname = os.path.dirname(tmp_path)
+        if not os.path.isdir(tmp_path_dirname):
+            os.makedirs(tmp_path_dirname)
         return tmp_path
+
+
+    def _open_tmpfile(self, path):
+        tmp_path = self._tmp_path(path)
+        tmp_fh = open(tmp_path, 'w+b')
+        self._tmpfiles[path] = {'fh': tmp_fh,
+                                'path': tmp_path,
+                                'dirty': False}
+        self._logger.debug('Opened temp copy %s of WebHDFS file %s',
+                           tmp_path, path)
+        return tmp_fh
 
 
     def _gid(self, group):
@@ -329,16 +345,52 @@ class Javanicus(fuse.Operations):
                 if bits_to_consider[bit][ugo] & mode:
                     break
             else:
+                permission_name = {os.R_OK: 'read',
+                                   os.W_OK: 'write',
+                                   os.X_OK: 'execute'}[bit]
                 self._logger.warning(
-                    'No %s permission for uid %s, gid %s for %s',
-                    bit, uid, gid, path)
+                    'No %s permission for uid %s, gid %s for \'%s\'.',
+                    permission_name, uid, gid, path)
                 raise fuse.FuseOSError(errno.EACCES)
         return 0
+
+
+    def create(self, path, mode):
+        permissions = stat.S_IMODE(mode)
+        rv = self._hdfs.create(path, permissions, user=self._current_user)
+        if rv == 0:
+            # only open the tmpfile if the create call succeeds
+            self._open_tmpfile(path)
+        return rv
 
 
     def destroy(self, path):
         self._hdfs.close()
         self._hdfs = None
+
+
+    def flush(self, path, fh):
+        return self.fsync(path, None, fh)
+
+
+    def fsync(self, path, datasync, fh):
+        if self._tmpfiles[path]['dirty']:
+            tmp_fh = self._tmpfiles[path]['fh']
+
+            # save current file pointer
+            current_location = tmp_fh.tell()
+
+            # seek to beginning, read in whole file
+            tmp_fh.seek(0)
+            data = tmp_fh.read()
+
+            # restore file pointer
+            tmp_fh.seek(current_location)
+
+            # write file to hdfs
+            self._hdfs.put(path, data, user=self._current_user)
+            self._tmpfiles[path]['dirty'] = False
+        return 0
 
 
     def getattr(self, path, fh=None):
@@ -367,12 +419,10 @@ class Javanicus(fuse.Operations):
         if path in self._tmpfiles:
             raise fuse.FuseOSError(errno.EIO)
 
-        tmp_path = self._tmp_path(path)
-        tmp_fh = open(tmp_path, 'w+b')
+        tmp_fh = self._open_tmpfile(path)
         tmp_fh.write(self._hdfs.get(path, user=self._current_user))
         tmp_fh.seek(0)
-        self._tmpfiles[path] = {'fh': tmp_fh,
-                                'path': tmp_path}
+
         return 0
 
 
@@ -390,11 +440,26 @@ class Javanicus(fuse.Operations):
 
     def release(self, path, fh):
         # TODO - support more than one handle on file at once
+        self.fsync(path, None, fh)
+
+        # clean up the local temp copy
         tmp_fh = self._tmpfiles[path]['fh']
-        tmp_path = self._tmpfiles[path]['path']
         tmp_fh.close()
+        tmp_path = self._tmpfiles[path]['path']
         os.remove(tmp_path)
         del(self._tmpfiles[path])
+        return 0
+
+
+    def write(self, path, data, offset, fh):
+        # TODO - support more than one handle on file at once
+        tmp_fh = self._tmpfiles[path]['fh']
+        tmp_fh.seek(offset)
+        tmp_fh.write(data)
+        self._tmpfiles[path]['dirty'] = True
+        self._logger.debug('Wrote %s bytes to temp copy of %s',
+                           len(data), path)
+        return len(data)
 
 
 class OldJavanicus(fuse.Operations):
@@ -464,8 +529,6 @@ class OldJavanicus(fuse.Operations):
             if e.response.status_code == requests.codes.not_found:
                 raise fuse.FuseOSError(errno.ENOENT)
             else:
-                print e.response.request.method, e.response.request.url
-                import ipdb; ipdb.set_trace()
                 raise
         except Exception as e:
             import ipdb; ipdb.set_trace()
