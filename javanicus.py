@@ -44,6 +44,175 @@ import fuse
 import requests
 
 
+class WebHDFS(object):
+    '''
+    Abstracts away some basic file operations for a webhdfs server.
+    '''
+    class WebHDFSError(IOError): pass
+    class WebHDFSFileNotFoundError(WebHDFSError): pass
+
+
+    def __init__(self, host, port, debug=True):
+        self._logger = logging.getLogger(self.__class__.__name__)
+        self._logger.setLevel(logging.DEBUG if debug else logging.INFO)
+
+        self._host = host
+        self._port = port
+        self._base_url = 'http://%s:%s/webhdfs/v1/' % (self._host, self._port)
+        self._session = requests.session()
+
+
+    def _raise_and_log_for_status(self, response):
+        try:
+            response.raise_for_status()
+        except requests.HTTPError as e:
+            request_line = '%s %s' % (response.request.method,
+                                      response.request.url)
+            if e.response.status_code == requests.codes.not_found:
+                raise WebHDFS.WebHDFSFileNotFoundError('%s not found.' % path)
+            else:
+                self._logger.warn('\n%s\n\n%s\n%s',
+                                  request_line, e, response.text)
+                raise WebHDFS.WebHDFSError('%s returned %s: %s'
+                                           % (request_line, e,
+                                              e.response.text))
+
+
+    def _url(self, path):
+        # strip the leading / to please urljoin
+        return urlparse.urljoin(self._base_url, path.lstrip('/'))
+
+
+    def close(self):
+        self._session.close()
+        self._session = None
+
+
+    def create(self, path, mode, user=None):
+        '''
+        <put to namenode, don't auto-follow the redirect>
+
+        PUT /webhdfs/v1/<PATH>?op=CREATE[&overwrite=<true|false>]
+                                        [&blocksize=<LONG>]
+                                        [&replication=<SHORT>]
+                                        [&permission=<OCTAL>]
+                                        [&buffersize=<INT>]
+
+        <namenode responds with a redirect to a datanode, which we ignore>
+        HTTP/1.1 307 TEMPORARY_REDIRECT
+        Location: http://<DATANODE>:<PORT>/webhdfs/v1/<PATH>?op=CREATE...
+        Content-Length: 0
+        '''
+        params = {'op': 'CREATE',
+                  'permission': oct(int(mode))}
+        if user is not None:
+            params['user.name'] = user
+
+        response = self._session.put(self._url(path), params=params)
+        self._raise_and_log_for_status(response)
+
+
+    def delete(self, path, recursive=False, user=None):
+        '''
+        DELETE /webhdfs/v1/<path>?op=DELETE[&recursive=<true|false>]
+        '''
+        params = {'op': 'DELETE',
+                  'recursive': str(recursive).lower()}
+        if user is not None:
+            params['user.name'] = user
+
+        response = self._session.delete(self._url(path), params=params)
+        self._raise_and_log_for_status(response)
+        if not response.json()['boolean'] == True:
+            raise IOError('Error deleting %s: %s' % (path, response.text))
+        return 0
+
+
+    def get(self, path, user=None):
+        '''
+        GET /webhdfs/v1/<PATH>?op=OPEN[&offset=<LONG>][&length=<LONG>]
+                                      [&buffersize=<INT>]
+
+        <namenode redirects to datanode, requests will auto-follow>
+        '''
+        params = {'op': 'OPEN'}
+        if user is not None:
+            params['user.name'] = user
+
+        response = self._session.get(self._url(path), params=params)
+        self._raise_and_log_for_status(response)
+        return response.content
+
+
+    def getattr(self, path, user=None):
+        '''
+        GET /webhdfs/v1/<PATH>?op=GETFILESTATUS
+        '''
+        params={'op': 'GETFILESTATUS'}
+        if user is not None:
+            params['user.name'] = user
+
+        response = self._session.get(self._url(path), params=params)
+        self._raise_and_log_for_status(response)
+        return response.json()['FileStatus']
+
+
+    def list(self, path, user=None):
+        '''
+        GET /webhdfs/v1/<PATH>?op=LISTSTATUS
+        '''
+        params = {'op': 'LISTSTATUS'}
+        if user is not None:
+            params['user.name'] = user
+
+        response = self._session.get(self._url(path), params=params)
+        self._raise_and_log_for_status(response)
+        return response.json()['FileStatuses']['FileStatus']
+
+
+    def put(self, path, data, mode=None, user=None):
+        '''
+        <put to namenode, don't auto-follow the redirect>
+
+        PUT /webhdfs/v1/<PATH>?op=CREATE[&overwrite=<true|false>]
+                                        [&blocksize=<LONG>]
+                                        [&replication=<SHORT>]
+                                        [&permission=<OCTAL>]
+                                        [&buffersize=<INT>]
+
+        <namenode responds with a redirect to a datanode>
+        HTTP/1.1 307 TEMPORARY_REDIRECT
+        Location: http://<DATANODE>:<PORT>/webhdfs/v1/<PATH>?op=CREATE...
+        Content-Length: 0
+
+        <put to datanode with file contents>
+        PUT /webhdfs/v1/<PATH>?op=CREATE...
+
+        <datanode responds with 201 created>
+        HTTP/1.1 201 Created
+        Location: webhdfs://<HOST>:<PORT>/<PATH>
+        Content-Length: 0
+
+        '''
+        # append is the same flow as write, but POST with op=APPEND
+        params = {'op': 'CREATE',
+                  'overwrite': 'true'}
+        if user is not None:
+            params['user.name'] = user
+
+        s1_response = self._session.put(self._url(path), params=params,
+                                        allow_redirects=False)
+        self._raise_and_log_for_status(s1_response)
+
+        if 'location' not in s1_response.headers:
+            raise fuse.FuseOSError(errno.EIO)
+        s2_url = s1_response.headers['location'].replace('webhdfs:', 'http:')
+
+        s2_response = self._session.put(s2_url, params=params, data=data)
+        self._raise_and_log_for_status(s2_response)
+        return len(data)
+
+
 class Javanicus(fuse.Operations):
     MODE_FLAGS = {
         'DIRECTORY': stat.S_IFDIR,
@@ -56,12 +225,8 @@ class Javanicus(fuse.Operations):
         self._logger = logging.getLogger(self.__class__.__name__)
         self._logger.setLevel(logging.DEBUG if debug else logging.INFO)
 
-        self._host = host
-        self._port = port
+        self._hdfs = WebHDFS(host, port, debug)
         self._mountpoint = os.path.abspath(mountpoint).rstrip('/')
-
-        self._base_url = 'http://%s:%s/webhdfs/v1/' % (self._host, self._port)
-        self._session = requests.session()
 
 
     def __call__(self, *args, **kwargs):
@@ -69,15 +234,12 @@ class Javanicus(fuse.Operations):
         return super(Javanicus, self).__call__(*args, **kwargs)
 
 
-    def _url(self, path):
-        # strip the leading / to please urljoin
-        return urlparse.urljoin(self._base_url, path.lstrip('/'))
-
-
     def _gid(self, group):
         try:
             return grp.getgrnam(group).gr_gid
         except KeyError:
+            self._logger.debug('No gid found for group %s, defaulting to 0',
+                               group)
             return 0
 
 
@@ -85,13 +247,17 @@ class Javanicus(fuse.Operations):
         try:
             return grp.getgrgid(gid).gr_name
         except KeyError:
+            self._logger.debug('No group found for gid %s, defaulting to root',
+                               gid)
             return 'root'
 
 
-    def _uid(self, username):
+    def _uid(self, user):
         try:
-            return pwd.getpwnam(username).pw_uid
+            return pwd.getpwnam(user).pw_uid
         except KeyError:
+            self._logger.debug('No uid found for user %s, defaulting to 0',
+                               user)
             return 0
 
 
@@ -99,6 +265,8 @@ class Javanicus(fuse.Operations):
         try:
             return pwd.getpwuid(uid).pw_name
         except KeyError:
+            self._logger.debug('No user found for uid %s, defaulting to root',
+                               uid)
             return 'root'
 
 
@@ -108,18 +276,43 @@ class Javanicus(fuse.Operations):
         return self._user(uid)
 
 
-    def _raise_and_log_for_status(self, response):
+    def destroy(self, path):
+        self._hdfs.close()
+        self._hdfs = None
+
+
+    def getattr(self, path, fh=None):
         try:
-            response.raise_for_status()
-        except requests.HTTPError as e:
-            self._logger.warn('\n%s %s\n\n%s\n%s',
-                              response.request.method,
-                              response.request.url,
-                              e,
-                              response.text) 
-            raise
+            hdfs_status = self._hdfs.getattr(path, user=self._current_user)
+        except WebHDFS.WebHDFSFileNotFoundError as e:
+            raise fuse.FuseOSError(errno.ENOENT)
 
 
+        # NB - timestamps in hdfs_status are milliseconds since epoch,
+        #      and timestamps in status need to be seconds since epoch
+        status = {
+            'st_atime': hdfs_status['accessTime'] / float(1000),
+            'st_gid': self._gid(hdfs_status['group']),
+            'st_mode': (int(hdfs_status['permission'], 8)
+                        | self.MODE_FLAGS[hdfs_status['type']]),
+            'st_mtime': hdfs_status['modificationTime'] / float(1000),
+            'st_size': hdfs_status['length'],
+            'st_uid': self._uid(hdfs_status['owner']),
+        }
+        return status
+
+
+    def readdir(self, path, fh):
+        try:
+            statuses = self._hdfs.list(path, user=self._current_user)
+        except WebHDFS.WebHDFSFileNotFoundError as e:
+            raise fuse.FuseOSError(errno.ENOENT)
+
+        dir_contents = ['.', '..'] + [s['pathSuffix'] for s in statuses]
+        return dir_contents
+
+
+class OldJavanicus(fuse.Operations):
     def chmod(self, path, mode):
         '''
         PUT /webhdfs/v1/<PATH>?op=SETPERMISSION[&permission=<OCTAL>]
