@@ -73,9 +73,9 @@ class WebHDFS(object):
             if e.response.status_code == requests.codes.not_found:
                 raise WebHDFS.WebHDFSFileNotFoundError(response.request.url)
             else:
-                import ipdb; ipdb.set_trace()
                 self._logger.warn('\n%s\n\n%s\n%s',
                                   request_line, e, response.text)
+                import ipdb; ipdb.set_trace()
                 raise WebHDFS.WebHDFSError('%s returned %s: %s'
                                            % (request_line, e,
                                               e.response.text))
@@ -215,6 +215,21 @@ class WebHDFS(object):
         s2_response = self._session.put(s2_url, data=data)
         self._raise_and_log_for_status(s2_response)
         return len(data)
+
+
+    def rename(self, old, new, user=None):
+        '''
+        PUT /webhdfs/v1/<PATH>?op=RENAME&destination=<PATH>
+        '''
+        params = {'op': 'RENAME',
+                  'destination': new}
+        if user is not None:
+            params['user.name'] = user
+        response = self._session.put(self._url(old), params=params)
+        self._raise_and_log_for_status(response)
+        if not response.json()['boolean']:
+            raise fuse.FuseOSError(errno.EREMOTEIO)
+        return 0
 
 
 class Javanicus(fuse.Operations):
@@ -449,6 +464,18 @@ class Javanicus(fuse.Operations):
         os.remove(tmp_path)
         del(self._tmpfiles[path])
         return 0
+
+
+    def rename(self, old, new):
+        assert old not in self._tmpfiles and new not in self._tmpfiles
+        try:
+            hdfs_status = self._hdfs.getattr(new, user=self._current_user)
+        except WebHDFS.WebHDFSFileNotFoundError as e:
+            pass
+        else:
+            self.unlink(new)
+
+        return self._hdfs.rename(old, new, user=self._current_user)
 
 
     def truncate(self, path, length, fh=None):
