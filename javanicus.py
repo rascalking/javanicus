@@ -37,6 +37,7 @@ import grp
 import logging
 import os
 import pwd
+import shutil
 import stat
 import urlparse
 
@@ -219,6 +220,7 @@ class Javanicus(fuse.Operations):
         'FILE': stat.S_IFREG,
         'SYMLINK': stat.S_IFLNK,
     }
+    TMPDIR = '/var/tmp/javanicus'
 
 
     def __init__(self, host, port, mountpoint='.', debug=True):
@@ -228,10 +230,20 @@ class Javanicus(fuse.Operations):
         self._hdfs = WebHDFS(host, port, debug)
         self._mountpoint = os.path.abspath(mountpoint).rstrip('/')
 
+        if os.path.exists(self.TMPDIR):
+            shutil.rmtree(self.TMPDIR, ignore_errors=True)
+        self._tmpfiles = {}
+
 
     def __call__(self, *args, **kwargs):
         self._logger.debug('%s %s', args, kwargs)
         return super(Javanicus, self).__call__(*args, **kwargs)
+
+
+    def _tmp_path(self, path):
+        tmp_path = os.path.join(self.TMPDIR, path.lstrip('/'))
+        os.makedirs(os.path.dirname(tmp_path))
+        return tmp_path
 
 
     def _gid(self, group):
@@ -276,6 +288,54 @@ class Javanicus(fuse.Operations):
         return self._user(uid)
 
 
+    def access(self, path, amode):
+        # map from requested bitmask to bitmask to check against.  we don't
+        # have to worrk about os.F_OK, because fuse will do a getattr to make
+        # sure the path exists before calling access().
+        bits_to_consider = {
+            os.R_OK: {'user': stat.S_IRUSR,
+                      'group': stat.S_IRGRP,
+                      'other': stat.S_IROTH},
+            os.W_OK: {'user': stat.S_IWUSR,
+                      'group': stat.S_IWGRP,
+                      'other': stat.S_IWOTH},
+            os.X_OK: {'user': stat.S_IXUSR,
+                      'group': stat.S_IXGRP,
+                      'other': stat.S_IXOTH},
+        }
+
+        # stat the file, get the mode
+        status = self.getattr(path)
+        mode = status['st_mode']
+
+        # check for our current uid/gid
+        uid, gid, _ = fuse.fuse_get_context()
+
+        # separate out the bits that were requested
+        bits_requested = [b for b in os.R_OK, os.W_OK, os.X_OK if b & amode]
+
+        # figure out which of user/group/other we might possibly match against
+        ugo_matches = ['other']
+        if gid == status['st_gid']:
+            ugo_matches.insert(0, 'group')
+        if uid == status['st_uid']:
+            ugo_matches.insert(0, 'user')
+
+        # finally, check for sufficient permissions.  raise an error as
+        # soon as we see a requested mode that doesn't match.  if we make it
+        # through this, then we have sufficient permissions.
+        for bit in bits_requested:
+            for ugo in ugo_matches:
+                if bits_to_consider[bit][ugo] & mode:
+                    break
+            else:
+                self._logger.warning(
+                    'No %s permission for uid %s, gid %s for %s',
+                    bit, uid, gid, path)
+                raise fuse.FuseOSError(errno.EACCES)
+        return 0
+
+
     def destroy(self, path):
         self._hdfs.close()
         self._hdfs = None
@@ -302,15 +362,39 @@ class Javanicus(fuse.Operations):
         return status
 
 
+    def open(self, path, flags):
+        # TODO - support more than one handle on file at once
+        if path in self._tmpfiles:
+            raise fuse.FuseOSError(errno.EIO)
+
+        tmp_path = self._tmp_path(path)
+        tmp_fh = open(tmp_path, 'w+b')
+        tmp_fh.write(self._hdfs.get(path, user=self._current_user))
+        tmp_fh.seek(0)
+        self._tmpfiles[path] = {'fh': tmp_fh,
+                                'path': tmp_path}
+        return 0
+
+
     def read(self, path, size, offset, fh):
-        data = self._hdfs.get(path, user=self._current_user)
-        return data[offset:offset+size]
+        tmp_fh = self._tmpfiles[path]['fh']
+        tmp_fh.seek(offset)
+        return tmp_fh.read(size)
 
 
     def readdir(self, path, fh):
         statuses = self._hdfs.list(path, user=self._current_user)
         dir_contents = ['.', '..'] + [s['pathSuffix'] for s in statuses]
         return dir_contents
+
+
+    def release(self, path, fh):
+        # TODO - support more than one handle on file at once
+        tmp_fh = self._tmpfiles[path]['fh']
+        tmp_path = self._tmpfiles[path]['path']
+        tmp_fh.close()
+        os.remove(tmp_path)
+        del(self._tmpfiles[path])
 
 
 class OldJavanicus(fuse.Operations):
