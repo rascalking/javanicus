@@ -69,7 +69,7 @@ class WebHDFS(object):
             request_line = '%s %s' % (response.request.method,
                                       response.request.url)
             if e.response.status_code == requests.codes.not_found:
-                raise WebHDFS.WebHDFSFileNotFoundError('%s not found.' % path)
+                raise WebHDFS.WebHDFSFileNotFoundError(response.request.url)
             else:
                 self._logger.warn('\n%s\n\n%s\n%s',
                                   request_line, e, response.text)
@@ -302,12 +302,13 @@ class Javanicus(fuse.Operations):
         return status
 
 
-    def readdir(self, path, fh):
-        try:
-            statuses = self._hdfs.list(path, user=self._current_user)
-        except WebHDFS.WebHDFSFileNotFoundError as e:
-            raise fuse.FuseOSError(errno.ENOENT)
+    def read(self, path, size, offset, fh):
+        data = self._hdfs.get(path, user=self._current_user)
+        return data[offset:offset+size]
 
+
+    def readdir(self, path, fh):
+        statuses = self._hdfs.list(path, user=self._current_user)
         dir_contents = ['.', '..'] + [s['pathSuffix'] for s in statuses]
         return dir_contents
 
