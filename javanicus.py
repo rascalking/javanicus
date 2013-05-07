@@ -51,6 +51,7 @@ class WebHDFS(object):
     Abstracts away some basic file operations for a webhdfs server.
     '''
     class WebHDFSError(IOError): pass
+    class WebHDFSDirectoryNotEmptyError(WebHDFSError): pass
     class WebHDFSFileNotFoundError(WebHDFSError): pass
 
 
@@ -72,6 +73,9 @@ class WebHDFS(object):
                                       response.request.url)
             if e.response.status_code == requests.codes.not_found:
                 raise WebHDFS.WebHDFSFileNotFoundError(response.request.url)
+            elif (e.response.status_code == requests.codes.forbidden
+                      and e.response.json()['RemoteException']['message'].endswith(' is non empty')):
+                raise WebHDFS.WebHDFSDirectoryNotEmptyError(response.request.url)
             else:
                 self._logger.warn('\n%s\n\n%s\n%s',
                                   request_line, e, response.text)
@@ -174,7 +178,24 @@ class WebHDFS(object):
         return response.json()['FileStatuses']['FileStatus']
 
 
-    def put(self, path, data, mode=None, user=None):
+    def mkdir(self, path, permissions=None, user=None):
+        '''
+        PUT /webhdfs/v1/<PATH>?op=MKDIRS[&permission=<OCTAL>]
+        '''
+        params = {'op': 'MKDIRS'}
+        if user is not None:
+            params['user.name'] = user
+        if permissions is not None:
+            params['permission'] = oct(int(permissions))
+
+        response = self._session.put(self._url(path), params=params)
+        self._raise_and_log_for_status(response)
+        if not response.json()['boolean']:
+            raise fuse.FuseOSError(errno.EREMOTEIO)
+        return 0
+
+
+    def put(self, path, data, permissions=None, user=None):
         '''
         <put to namenode, don't auto-follow the redirect>
 
@@ -196,13 +217,14 @@ class WebHDFS(object):
         HTTP/1.1 201 Created
         Location: webhdfs://<HOST>:<PORT>/<PATH>
         Content-Length: 0
-
         '''
         # append is the same flow as write, but POST with op=APPEND
         params = {'op': 'CREATE',
                   'overwrite': 'true'}
         if user is not None:
             params['user.name'] = user
+        if permissions is not None:
+            params['permission'] = oct(int(permissions))
 
         s1_response = self._session.put(self._url(path), params=params,
                                         allow_redirects=False)
@@ -403,6 +425,7 @@ class Javanicus(fuse.Operations):
             tmp_fh.seek(current_location)
 
             # write file to hdfs
+            # TODO - send permissions
             self._hdfs.put(path, data, user=self._current_user)
             self._tmpfiles[path]['dirty'] = False
         return 0
@@ -427,6 +450,13 @@ class Javanicus(fuse.Operations):
             'st_uid': self._uid(hdfs_status['owner']),
         }
         return status
+
+
+
+    def mkdir(self, path, mode):
+        permissions = stat.S_IMODE(mode)
+        return self._hdfs.mkdir(path, permissions=permissions,
+                                user=self._current_user)
 
 
     def open(self, path, flags):
@@ -478,6 +508,14 @@ class Javanicus(fuse.Operations):
         return self._hdfs.rename(old, new, user=self._current_user)
 
 
+    def rmdir(self, path):
+        assert not any(p.startswith(path) for p in self._tmpfiles)
+        try:
+            return self._hdfs.delete(path, user=self._current_user)
+        except WebHDFS.WebHDFSDirectoryNotEmptyError as e:
+            raise fuse.FuseOSError(errno.ENOTEMPTY)
+
+
     def truncate(self, path, length, fh=None):
         tmp_fh = self._tmpfiles[path]['fh']
         tmp_fh.truncate(length)
@@ -485,6 +523,7 @@ class Javanicus(fuse.Operations):
 
 
     def unlink(self, path):
+        assert path not in self._tmpfiles
         # TODO: flush?
         return self._hdfs.delete(path, user=self._current_user)
 
