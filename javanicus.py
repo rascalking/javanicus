@@ -451,6 +451,17 @@ class Javanicus(fuse.Operations):
         return 0
 
 
+    def truncate(self, path, length, fh=None):
+        tmp_fh = self._tmpfiles[path]['fh']
+        tmp_fh.truncate(length)
+        return 0
+
+
+    def unlink(self, path):
+        # TODO: flush?
+        return self._hdfs.delete(path, user=self._current_user)
+
+
     def write(self, path, data, offset, fh):
         # TODO - support more than one handle on file at once
         tmp_fh = self._tmpfiles[path]['fh']
