@@ -1,5 +1,7 @@
 #!/usr/bin/env perl
 
 use Test::Virtual::Filesystem;
-Test::Virtual::Filesystem->new({mountdir => $ARGV[0]})->runtests;
-exit 0;
+
+my $tester = Test::Virtual::Filesystem->new({mountdir => $ARGV[0]});
+$tester->enable_test_symlink(0);
+$tester->runtests;
