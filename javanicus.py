@@ -48,6 +48,7 @@ import os
 import pwd
 import shutil
 import stat
+import tempfile
 import time
 import urllib
 import urlparse
@@ -330,8 +331,6 @@ class Javanicus(fuse.Operations):
         'FILE': stat.S_IFREG,
         'SYMLINK': stat.S_IFLNK,
     }
-    # TODO - use tempfile so each mount gets its own tmpdir
-    TMPDIR = '/var/tmp/javanicus'
 
 
     def __init__(self, host, port, mountpoint='.', debug=True):
@@ -341,9 +340,7 @@ class Javanicus(fuse.Operations):
         self._hdfs = WebHDFS(host, port, debug)
         self._mountpoint = os.path.abspath(mountpoint).rstrip('/')
 
-        # TODO - split tmpfile logic out into a separate class
-        if os.path.exists(self.TMPDIR):
-            shutil.rmtree(self.TMPDIR, ignore_errors=True)
+        self._tmpdir = tempfile.mkdtemp(prefix='javanicus')
         self._tmpfiles = {}
 
 
@@ -353,7 +350,7 @@ class Javanicus(fuse.Operations):
 
 
     def _tmp_path(self, path):
-        tmp_path = os.path.join(self.TMPDIR, path.lstrip('/'))
+        tmp_path = os.path.join(self._tmpdir, path.lstrip('/'))
         tmp_path_dirname = os.path.dirname(tmp_path)
         if not os.path.isdir(tmp_path_dirname):
             os.makedirs(tmp_path_dirname)
@@ -538,9 +535,9 @@ class Javanicus(fuse.Operations):
 
 
     def destroy(self, path):
-        # TODO - flush outstanding tmpfiles?
         self._hdfs.close()
         self._hdfs = None
+        shutil.rmtree(self._tmpdir)
 
 
     def flush(self, path, fh):
