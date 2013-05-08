@@ -53,6 +53,7 @@ class WebHDFS(object):
     class WebHDFSError(IOError): pass
     class WebHDFSDirectoryNotEmptyError(WebHDFSError): pass
     class WebHDFSFileNotFoundError(WebHDFSError): pass
+    class WebHDFSPermissionError(WebHDFSError): pass
 
 
     def __init__(self, host, port, debug=True):
@@ -69,25 +70,58 @@ class WebHDFS(object):
         try:
             response.raise_for_status()
         except requests.HTTPError as e:
-            request_line = '%s %s' % (response.request.method,
-                                      response.request.url)
             if e.response.status_code == requests.codes.not_found:
                 raise WebHDFS.WebHDFSFileNotFoundError(response.request.url)
-            elif (e.response.status_code == requests.codes.forbidden
-                      and e.response.json()['RemoteException']['message'].endswith(' is non empty')):
-                raise WebHDFS.WebHDFSDirectoryNotEmptyError(response.request.url)
-            else:
-                self._logger.warn('\n%s\n\n%s\n%s',
-                                  request_line, e, response.text)
-                import ipdb; ipdb.set_trace()
-                raise WebHDFS.WebHDFSError('%s returned %s: %s'
-                                           % (request_line, e,
-                                              e.response.text))
+            elif e.response.status_code == requests.codes.forbidden:
+                exception = e.response.json()['RemoteException']
+                if exception['message'].endswith(' is non empty'):
+                    raise WebHDFS.WebHDFSDirectoryNotEmptyError(
+                              response.request.url)
+                elif exception['exception'] == 'AccessControlException':
+                    raise WebHDFS.WebHDFSPermissionError(response.request.url)
+
+            # if we get this far, there's no special handling for this.
+            # log it and reraise it.
+            request_line = '%s %s' % (response.request.method,
+                                      response.request.url)
+            self._logger.warn('\n%s\n\n%s\n%s',
+                              request_line, e, response.text)
+            raise WebHDFS.WebHDFSError('%s returned %s: %s'
+                                       % (request_line, e, e.response.text))
 
 
     def _url(self, path):
         # strip the leading / to please urljoin
         return urlparse.urljoin(self._base_url, path.lstrip('/'))
+
+
+    def chmod(self, path, permissions, user=None):
+        '''
+        PUT /webhdfs/v1/<PATH>?op=SETPERMISSION[&permission=<OCTAL>]
+        '''
+        params = {'op': 'SETPERMISSION',
+                  'permission': oct(int(permissions))}
+        if user is not None:
+            params['user.name'] = user
+
+        response = self._session.put(self._url(path), params=params)
+        self._raise_and_log_for_status(response)
+        return 0
+
+
+    def chown(self, path, to_user, to_group, user=None):
+        '''
+        PUT /webhdfs/v1/<PATH>?op=SETOWNER[&user=<USER>][&group=<GROUP>]
+        '''
+        params = {'op': 'SETOWNER',
+                  'user': to_user,
+                  'group': to_group}
+        if user is not None:
+            params['user.name'] = user
+
+        response = self._session.put(self._url(path), params=params)
+        self._raise_and_log_for_status(response)
+        return 0
 
 
     def close(self):
@@ -392,6 +426,25 @@ class Javanicus(fuse.Operations):
         return 0
 
 
+    def chmod(self, path, mode):
+        assert path not in self._tmpfiles
+        # TODO - chmod tmpfile?
+        permissions = stat.S_IMODE(mode)
+        return self._hdfs.chmod(path, permissions, user=self._current_user)
+
+
+    def chown(self, path, uid, gid):
+        assert path not in self._tmpfiles
+        # TODO - chown tmpfile?
+        try:
+            return self._hdfs.chown(path,
+                                    to_user=self._user(uid),
+                                    to_group=self._user(gid),
+                                    user=self._current_user)
+        except WebHDFS.WebHDFSPermissionError as e:
+            raise fuse.FuseOSError(errno.EPERM)
+
+
     def create(self, path, mode):
         permissions = stat.S_IMODE(mode)
         rv = self._hdfs.create(path, permissions, user=self._current_user)
@@ -536,263 +589,6 @@ class Javanicus(fuse.Operations):
         self._tmpfiles[path]['dirty'] = True
         self._logger.debug('Wrote %s bytes to temp copy of %s',
                            len(data), path)
-        return len(data)
-
-
-class OldJavanicus(fuse.Operations):
-    def chmod(self, path, mode):
-        '''
-        PUT /webhdfs/v1/<PATH>?op=SETPERMISSION[&permission=<OCTAL>]
-        '''
-        response = self._session.put(self._url(path),
-                                    params={'op': 'SETPERMISSION',
-                                            'permission': oct(mode),
-                                            'user.name': self._current_user})
-        self._raise_and_log_for_status(response)
-        return 0
-
-
-    def chown(self, path, uid, gid):
-        '''
-        PUT /webhdfs/v1/<PATH>?op=SETOWNER[&user=<USER>][&group=<GROUP>]
-        '''
-        user = self._user(uid)
-        group = self._group(gid)
-        response = self._session.put(self._url(path),
-                                     params={'op': 'SETOWNER',
-                                             'user.name': self._current_user,
-                                             'user': user,
-                                             'group': group})
-        self._raise_and_log_for_status(response)
-        return 0
-
-
-    def create(self, path, mode):
-        '''
-        <put to namenode, don't auto-follow the redirect>
-
-        PUT /webhdfs/v1/<PATH>?op=CREATE[&overwrite=<true|false>]
-                                        [&blocksize=<LONG>]
-                                        [&replication=<SHORT>]
-                                        [&permission=<OCTAL>]
-                                        [&buffersize=<INT>]
-
-        <namenode responds with a redirect to a datanode, which we ignore>
-        HTTP/1.1 307 TEMPORARY_REDIRECT
-        Location: http://<DATANODE>:<PORT>/webhdfs/v1/<PATH>?op=CREATE...
-        Content-Length: 0
-        '''
-        response = self._session.put(self._url(path),
-                                     params={'op': 'CREATE',
-                                             'user.name': self._current_user,
-                                             'mode': oct(mode)})
-        self._raise_and_log_for_status(response)
-        return 0
-
-
-    def destroy(self, path):
-        self._session.close()
-
-
-    def getattr(self, path, fh=None):
-        '''
-        GET /webhdfs/v1/<PATH>?op=GETFILESTATUS
-        '''
-        response = self._session.get(self._url(path),
-                                    params={'op': 'GETFILESTATUS'})
-	try:
-            self._raise_and_log_for_status(response)
-        except requests.HTTPError as e:
-            if e.response.status_code == requests.codes.not_found:
-                raise fuse.FuseOSError(errno.ENOENT)
-            else:
-                raise
-        except Exception as e:
-            import ipdb; ipdb.set_trace()
-            raise
-        hdfs_status = response.json()['FileStatus']
-        # NB - timestamps in hdfs_status are milliseconds since epoch,
-        #      and timestamps in status need to be seconds since epoch
-        status = {
-            'st_atime': hdfs_status['accessTime'] / float(1000),
-            'st_gid': self._gid(hdfs_status['group']),
-            'st_mode': (int(hdfs_status['permission'], 8)
-                        | self.MODE_FLAGS[hdfs_status['type']]),
-            'st_mtime': hdfs_status['modificationTime'] / float(1000),
-            'st_size': hdfs_status['length'],
-            'st_uid': self._uid(hdfs_status['owner']),
-        }
-
-        return status
-
-
-    def mkdir(self, path, mode):
-        '''
-        PUT /webhdfs/v1/<PATH>?op=MKDIRS[&permission=<OCTAL>]
-        '''
-        response = self._session.put(self._url(path),
-                                    params={'op': 'MKDIRS',
-                                            'permission': permission})
-        self._raise_and_log_for_status(response)
-        if not response.json()['boolean']:
-            raise fuse.FuseOSError(errno.EREMOTEIO)
-        return 0
-
-
-    def read(self, path, size, offset, fh):
-        '''
-        GET /webhdfs/v1/<PATH>?op=OPEN[&offset=<LONG>][&length=<LONG>]
-                                      [&buffersize=<INT>]
-
-        <namenode redirects to datanode, requests will auto-follow>
-        '''
-        response = self._session.get(self._url(path), params={'op': 'OPEN',
-                                                              'offset': offset,
-                                                              'length': size})
-        self._raise_and_log_for_status(response)
-        # TODO - sanity check the response size vs. requested size?
-        return response.content
-
-
-    def readdir(self, path, fh):
-        '''
-        GET /webhdfs/v1/<PATH>?op=LISTSTATUS
-        '''
-        response = self._session.get(self._url(path),
-                                    params={'op': 'LISTSTATUS'})
-        self._raise_and_log_for_status(response)
-        dir_contents = ['.', '..']
-        for status in response.json()['FileStatuses']['FileStatus']:
-            dir_contents.append(status['pathSuffix'])
-        return dir_contents
-
-
-    def rename(self, old, new):
-        '''
-        PUT /webhdfs/v1/<PATH>?op=RENAME&destination=<PATH>
-        '''
-        response = self._session.put(self._url(old), params={'op': 'RENAME',
-                                                            'destination': new})
-        self._raise_and_log_for_status(response)
-        if not response.json()['boolean']:
-            raise fuse.FuseOSError(errno.EREMOTEIO)
-        return 0
-
-
-
-    def rmdir(self, path):
-        '''
-        DELETE /webhdfs/v1/<path>?op=DELETE[&recursive=<true|false>]
-        '''
-        response = self._session.delete(self._url(path), params={'op': 'DELETE'})
-        self._raise_and_log_for_status(response)
-        if not response.json()['boolean']:
-            raise fuse.FuseOSError(errno.EREMOTEIO)
-        return 0
-
-
-    def truncate(self, path, length, fh=None):
-        if length == 0:
-            self._logger.debug('truncate -> getattr')
-            mode = stat.S_IMODE(self.getattr(path, fh)['st_mode'])
-            self._logger.debug('truncate -> create')
-            response = self._session.put(
-                           self._url(path),
-                           params={'op': 'CREATE',
-                                   'user.name': self._current_user,
-                                   'mode': oct(mode),
-                                   'overwrite': 'true'})
-            self._raise_and_log_for_status(response)
-            return self.create(path, mode)
-        else:
-            raise FuseOSError(errno.EROFS)
-
-
-    def unlink(self, path):
-        '''
-        DELETE /webhdfs/v1/<path>?op=DELETE[&recursive=<true|false>]
-        '''
-        response = self._session.delete(self._url(path),
-                                        params={'op': 'DELETE',
-                                                'user.name': self._current_user})
-        self._raise_and_log_for_status(response)
-        if not response.json()['boolean']:
-            raise fuse.FuseOSError(errno.EREMOTEIO)
-        return 0
-
-
-    def write(self, path, data, offset, fh):
-        '''
-        There's no way to write specific byte ranges to a file in the webhdfs
-        api.  So, we use a couple different approaches.
-
-        If the offset < the current size, we have to get the whole file (in
-        memory for now, should pick a threshold where we write it to a temp
-        file), patch it locally, then write the whole goddamned thing back up.
-
-        If the offset == the current size, we can just use append.
-
-        If the offset > the current size, we pad it out with zeroes,
-        then use append.
-        '''
-        current_size = self.getattr(path)['st_size']
-        if offset > current_size:
-            zeroes = '\0' * offset
-            self._write_file(path, zeroes, append=True)
-            self._write_file(path, data, append=True)
-        elif offset == current_size:
-            self._write_file(path, data, append=True)
-        else: # offset < current_size
-            # get file
-            contents[offset:offset+len(data)] = data
-            self._write_file(path, contents)
-        return self._write_file(path, data)
-
-
-    def _write_file(self, path, data, append=False):
-        '''
-        <put to namenode, don't auto-follow the redirect>
-
-        PUT /webhdfs/v1/<PATH>?op=CREATE[&overwrite=<true|false>]
-                                        [&blocksize=<LONG>]
-                                        [&replication=<SHORT>]
-                                        [&permission=<OCTAL>]
-                                        [&buffersize=<INT>]
-
-        <namenode responds with a redirect to a datanode>
-        HTTP/1.1 307 TEMPORARY_REDIRECT
-        Location: http://<DATANODE>:<PORT>/webhdfs/v1/<PATH>?op=CREATE...
-        Content-Length: 0
-
-        <put to datanode with empty file contents...do we need to do this?>
-        PUT /webhdfs/v1/<PATH>?op=CREATE...
-
-        <datanode responds with 201 created>
-        HTTP/1.1 201 Created
-        Location: webhdfs://<HOST>:<PORT>/<PATH>
-        Content-Length: 0
-
-        '''
-        # append is the same flow as write, but POST with op=APPEND
-        method = self._session.post if append else self._session.put
-        op = 'APPEND' if append else 'CREATE'
-        overwrite = 'false' if append else 'true'
-
-        s1_response = method(self._url(path),
-                             params={'op': op,
-                                     'user.name': self._current_user,
-                                     'overwrite': overwrite},
-                             allow_redirects=False)
-        self._raise_and_log_for_status(s1_response)
-        if 'location' not in s1_response.headers:
-            raise fuse.FuseOSError(errno.EIO)
-        s2_url = s1_response.headers['location'].replace('webhdfs:', 'http:')
-        s2_response = method(s2_url,
-                             params={'op': op,
-                                     'user.name': self._current_user,
-                                     'overwrite': overwrite},
-                             data=data)
-        self._raise_and_log_for_status(s2_response)
         return len(data)
 
 
