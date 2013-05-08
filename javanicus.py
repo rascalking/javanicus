@@ -615,7 +615,10 @@ class Javanicus(fuse.Operations):
         except WebHDFS.WebHDFSFileNotFoundError as e:
             pass
         else:
-            self.unlink(new)
+            try:
+                self.unlink(new)
+            except WebHDFS.WebHDFSDirectoryNotEmptyError as e:
+                raise fuse.FuseOSError(errno.ENOTEMPTY)
 
         return self._hdfs.rename(old, new, user=self._current_user)
 
@@ -629,21 +632,30 @@ class Javanicus(fuse.Operations):
 
 
     def truncate(self, path, length, fh=None):
-        # first, make sure we're up to date with the server
-        self._refresh_tmpfile(path)
+        def _truncate(self, path):
+            self._refresh_tmpfile(path)
 
-        # now, truncate locally
-        tmp_fh = self._tmpfiles[path]['fh']
-        tmp_fh.truncate(length)
+            # now, truncate locally
+            tmp_fh = self._tmpfiles[path]['fh']
+            tmp_fh.truncate(length)
 
-        # flag it dirty, push it to the server
-        self._tmpfiles[path]['dirty'] = True
-        self._push_tmpfile_if_dirty(path)
-        return 0
+            # flag it dirty, push it to the server
+            self._tmpfiles[path]['dirty'] = True
+            self._push_tmpfile_if_dirty(path)
+            return 0
+
+        # a file doesn't have to be open to call truncate on it
+        if path not in self._tmpfiles:
+            self._open_tmpfile(path)
+            try:
+               return _truncate(self, path)
+            finally:
+                self._remove_tmpfile(path)
+        else:
+            return _truncate(self, path)
 
 
     def unlink(self, path):
-        assert path not in self._tmpfiles
         return self._hdfs.delete(path, user=self._current_user)
 
 
