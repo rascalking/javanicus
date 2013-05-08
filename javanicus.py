@@ -57,7 +57,7 @@ class WebHDFS(object):
     class WebHDFSPermissionError(WebHDFSError): pass
 
 
-    def __init__(self, host, port, debug=True):
+    def __init__(self, host, port, debug=False):
         self._logger = logging.getLogger(self.__class__.__name__)
         self._logger.setLevel(logging.DEBUG if debug else logging.INFO)
 
@@ -94,6 +94,21 @@ class WebHDFS(object):
     def _url(self, path):
         # strip the leading / to please urljoin
         return urlparse.urljoin(self._base_url, path.lstrip('/'))
+
+
+    def checksum(self, path, user=None):
+        '''
+        GET /webhdfs/v1/<PATH>?op=GETFILECHECKSUM
+        '''
+        # NOTE - this works, but hadoop uses a checksum i don't have time to
+        #        try and duplicate here.  so this will be unused for now.
+        params = {'op': 'GETFILECHECKSUM'}
+        if user is not None:
+            params['user.name'] = user
+
+        response = self._session.get(self._url(path), params=params)
+        self._raise_and_log_for_status(response)
+        return response.json()['FileChecksum']
 
 
     def chmod(self, path, permissions, user=None):
@@ -490,7 +505,7 @@ class Javanicus(fuse.Operations):
             tmp_fh.seek(current_location)
 
             # write file to hdfs
-            # TODO - send permissions
+            # TODO - send permissions?
             self._hdfs.put(path, data, user=self._current_user)
             self._tmpfiles[path]['dirty'] = False
         return 0
@@ -588,8 +603,8 @@ class Javanicus(fuse.Operations):
 
 
     def unlink(self, path):
+        # TODO: flush and close?
         assert path not in self._tmpfiles
-        # TODO: flush?
         return self._hdfs.delete(path, user=self._current_user)
 
 
@@ -610,6 +625,7 @@ class Javanicus(fuse.Operations):
         self._tmpfiles[path]['dirty'] = True
         self._logger.debug('Wrote %s bytes to temp copy of %s',
                            len(data), path)
+
         return len(data)
 
 
@@ -622,8 +638,11 @@ if __name__ == '__main__':
     parser.add_argument('host')
     parser.add_argument('port')
     parser.add_argument('mountpoint')
+    parser.add_argument('--debug', action='store_true', default=False)
     args = parser.parse_args()
 
-    fs = fuse.FUSE(Javanicus(args.host, args.port, args.mountpoint),
+    fs = fuse.FUSE(Javanicus(args.host, args.port, args.mountpoint, args.debug),
                    args.mountpoint,
-                   foreground=True, nothreads=True)
+                   foreground=True,
+                   nothreads=True,
+                   debug=args.debug)
