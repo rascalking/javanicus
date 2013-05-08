@@ -31,6 +31,15 @@ You should have received a copy of the GNU General Public License
 along with this program.  If not, see <http://www.gnu.org/licenses/>.
 '''
 
+'''
+WORKAROUNDS
+
+* no way to write small chunk of data to offset in file, have to write
+the whole thing.
+* no easy way to reimplement checksum algo locally, have to work with
+checksums from webhdfs.
+'''
+
 
 import errno
 import grp
@@ -321,6 +330,7 @@ class Javanicus(fuse.Operations):
         'FILE': stat.S_IFREG,
         'SYMLINK': stat.S_IFLNK,
     }
+    # TODO - use tempfile so each mount gets its own tmpdir
     TMPDIR = '/var/tmp/javanicus'
 
 
@@ -331,6 +341,7 @@ class Javanicus(fuse.Operations):
         self._hdfs = WebHDFS(host, port, debug)
         self._mountpoint = os.path.abspath(mountpoint).rstrip('/')
 
+        # TODO - split tmpfile logic out into a separate class
         if os.path.exists(self.TMPDIR):
             shutil.rmtree(self.TMPDIR, ignore_errors=True)
         self._tmpfiles = {}
@@ -354,10 +365,32 @@ class Javanicus(fuse.Operations):
         tmp_fh = open(tmp_path, 'w+b')
         self._tmpfiles[path] = {'fh': tmp_fh,
                                 'path': tmp_path,
-                                'dirty': False}
+                                'cksum': ''}
         self._logger.debug('Opened temp copy %s of WebHDFS file %s',
                            tmp_path, path)
         return tmp_fh
+
+
+    def _refresh_tmpfile(self, path):
+        # verifies our local copy vs. webhdfs, fetches new local copy as needed
+        cksum = self._hdfs.checksum(path, user=self._current_user)['bytes']
+        if cksum != self._tmpfiles[path]['cksum']:
+            tmp_fh = self._tmpfiles[path]['fh']
+            tmp_fh.seek(0)
+            tmp_fh.write(self._hdfs.get(path, user=self._current_user))
+
+            # be paranoid, assume the cksum mya have changed.  this doesn't
+            # completely protect us, but in the absence of something better...
+            cksum = self._hdfs.checksum(path, user=self._current_user)['bytes']
+            self._tmpfiles[path]['cksum'] = cksum
+
+
+    def _remove_tmpfile(self, path):
+        tmp_fh = self._tmpfiles[path]['fh']
+        tmp_fh.close()
+        tmp_path = self._tmpfiles[path]['path']
+        os.remove(tmp_path)
+        del(self._tmpfiles[path])
 
 
     def _gid(self, group):
@@ -454,15 +487,11 @@ class Javanicus(fuse.Operations):
 
 
     def chmod(self, path, mode):
-        assert path not in self._tmpfiles
-        # TODO - chmod tmpfile?
         permissions = stat.S_IMODE(mode)
         return self._hdfs.chmod(path, permissions, user=self._current_user)
 
 
     def chown(self, path, uid, gid):
-        assert path not in self._tmpfiles
-        # TODO - chown tmpfile?
         try:
             return self._hdfs.chown(path,
                                     to_user=self._user(uid),
@@ -473,6 +502,7 @@ class Javanicus(fuse.Operations):
 
 
     def create(self, path, mode):
+        assert path not in self._tmpfiles
         permissions = stat.S_IMODE(mode)
         rv = self._hdfs.create(path, permissions, user=self._current_user)
         if rv == 0:
@@ -484,31 +514,6 @@ class Javanicus(fuse.Operations):
     def destroy(self, path):
         self._hdfs.close()
         self._hdfs = None
-
-
-    def flush(self, path, fh):
-        return self.fsync(path, None, fh)
-
-
-    def fsync(self, path, datasync, fh):
-        if self._tmpfiles[path]['dirty']:
-            tmp_fh = self._tmpfiles[path]['fh']
-
-            # save current file pointer
-            current_location = tmp_fh.tell()
-
-            # seek to beginning, read in whole file
-            tmp_fh.seek(0)
-            data = tmp_fh.read()
-
-            # restore file pointer
-            tmp_fh.seek(current_location)
-
-            # write file to hdfs
-            # TODO - send permissions?
-            self._hdfs.put(path, data, user=self._current_user)
-            self._tmpfiles[path]['dirty'] = False
-        return 0
 
 
     def getattr(self, path, fh=None):
@@ -532,7 +537,6 @@ class Javanicus(fuse.Operations):
         return status
 
 
-
     def mkdir(self, path, mode):
         permissions = stat.S_IMODE(mode)
         return self._hdfs.mkdir(path, permissions=permissions,
@@ -540,18 +544,16 @@ class Javanicus(fuse.Operations):
 
 
     def open(self, path, flags):
-        # TODO - support more than one handle on file at once
         if path in self._tmpfiles:
             raise fuse.FuseOSError(errno.EIO)
 
         tmp_fh = self._open_tmpfile(path)
-        tmp_fh.write(self._hdfs.get(path, user=self._current_user))
-        tmp_fh.seek(0)
-
+        self._refresh_tmpfile(path)
         return 0
 
 
     def read(self, path, size, offset, fh):
+        self._refresh_tmpfile(path)
         tmp_fh = self._tmpfiles[path]['fh']
         tmp_fh.seek(offset)
         return tmp_fh.read(size)
@@ -564,15 +566,7 @@ class Javanicus(fuse.Operations):
 
 
     def release(self, path, fh):
-        # TODO - support more than one handle on file at once
-        self.fsync(path, None, fh)
-
-        # clean up the local temp copy
-        tmp_fh = self._tmpfiles[path]['fh']
-        tmp_fh.close()
-        tmp_path = self._tmpfiles[path]['path']
-        os.remove(tmp_path)
-        del(self._tmpfiles[path])
+        self._remove_tmpfile(path)
         return 0
 
 
@@ -597,13 +591,16 @@ class Javanicus(fuse.Operations):
 
 
     def truncate(self, path, length, fh=None):
+        self._refresh_tmpfile(path)
         tmp_fh = self._tmpfiles[path]['fh']
         tmp_fh.truncate(length)
+        tmp_fh.seek(0)
+        data = tmp_fh.read()
+        self._hdfs.put(path, data, user=self._current_user)
         return 0
 
 
     def unlink(self, path):
-        # TODO: flush and close?
         assert path not in self._tmpfiles
         return self._hdfs.delete(path, user=self._current_user)
 
@@ -618,14 +615,17 @@ class Javanicus(fuse.Operations):
 
 
     def write(self, path, data, offset, fh):
-        # TODO - support more than one handle on file at once
+        self._refresh_tmpfile(path)
         tmp_fh = self._tmpfiles[path]['fh']
         tmp_fh.seek(offset)
         tmp_fh.write(data)
-        self._tmpfiles[path]['dirty'] = True
         self._logger.debug('Wrote %s bytes to temp copy of %s',
                            len(data), path)
-
+        tmp_fh.seek(0)
+        full_data = tmp_fh.read()
+        self._hdfs.put(path, full_data, user=self._current_user)
+        self._logger.debug('Wrote full file (%s bytes) to WebHDFS copy of %s',
+                           len(full_data), path)
         return len(data)
 
 
