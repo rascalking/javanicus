@@ -39,6 +39,7 @@ import os
 import pwd
 import shutil
 import stat
+import time
 import urllib
 import urlparse
 
@@ -285,6 +286,17 @@ class WebHDFS(object):
         self._raise_and_log_for_status(response)
         if not response.json()['boolean']:
             raise fuse.FuseOSError(errno.EREMOTEIO)
+        return 0
+
+
+    def utime(self, path, atime, mtime, user=None):
+        params = {'op': 'SETTIMES',
+                  'accesstime': int(atime) * 1000,
+                  'modificationtime': int(mtime) * 1000}
+        if user is not None:
+            params['user.name'] = user
+        response = self._session.put(self._url(path), params=params)
+        self._raise_and_log_for_status(response)
         return 0
 
 
@@ -579,6 +591,15 @@ class Javanicus(fuse.Operations):
         assert path not in self._tmpfiles
         # TODO: flush?
         return self._hdfs.delete(path, user=self._current_user)
+
+
+    def utimens(self, path, times=None):
+        if times:
+            atime, mtime = times
+        else:
+            now = time.time()
+            atime, mtime = now, now
+        return self._hdfs.utime(path, atime, mtime, user=self._current_user)
 
 
     def write(self, path, data, offset, fh):
