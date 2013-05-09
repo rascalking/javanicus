@@ -1,5 +1,6 @@
 #!/usr/bin/env perl
 
+use local::lib;
 use Test::Virtual::Filesystem;
 
 my $tester = Test::Virtual::Filesystem->new({mountdir => $ARGV[0]});
@@ -9,5 +10,8 @@ $tester->enable_test_symlink(0);
 
 # hdfs doesn't have a concept of ctime they expose
 $tester->enable_test_ctime(0);
+
+# xattr support isn't implemented
+$tester->enable_test_xattr(0);
 
 $tester->runtests;
