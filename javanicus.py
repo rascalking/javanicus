@@ -1,13 +1,17 @@
 #!/usr/bin/env python
 
 '''
-javanicus from
+Javanicus - a WebHDFS FUSE driver
+https://github.com/rascalking/javanicus
+
+
+The name Javanicus comes from googling for "elephant snake", eg.
 http://www.iucnredlist.org/details/176718/0
 
-base ls command
+A simple ls command will be tranlsated to:
 $ curl -i -X GET "http://localhost:50070/webhdfs/v1/?op=LISTSTATUS"
 
-webhdfs docs
+WebHDFS docs:
 http://hadoop.apache.org/docs/r1.0.4/webhdfs.html
 
 fusepy docs
@@ -29,15 +33,6 @@ GNU General Public License for more details.
 
 You should have received a copy of the GNU General Public License
 along with this program.  If not, see <http://www.gnu.org/licenses/>.
-'''
-
-'''
-WORKAROUNDS
-
-* no way to write small chunk of data to offset in file, have to write
-the whole thing.
-* no easy way to reimplement checksum algo locally, have to work with
-checksums from webhdfs.
 '''
 
 
@@ -110,8 +105,6 @@ class WebHDFS(object):
         '''
         GET /webhdfs/v1/<PATH>?op=GETFILECHECKSUM
         '''
-        # NOTE - this works, but hadoop uses a checksum i don't have time to
-        #        try and duplicate here.  so this will be unused for now.
         params = {'op': 'GETFILECHECKSUM'}
         if user is not None:
             params['user.name'] = user
@@ -349,6 +342,13 @@ class Javanicus(fuse.Operations):
         return super(Javanicus, self).__call__(*args, **kwargs)
 
 
+    ######
+    ######
+    ## Tempfile methods
+    ##
+    ## Methods related to creating, updating, and deleting local copies of files
+    ##
+    ## TODO: refactor these out into a separate class
     def _tmp_path(self, path):
         tmp_path = os.path.join(self._tmpdir, path.lstrip('/'))
         tmp_path_dirname = os.path.dirname(tmp_path)
@@ -414,6 +414,13 @@ class Javanicus(fuse.Operations):
     def _set_tmpfile_cksum(self, path):
         cksum = self._hdfs.checksum(path, user=self._current_user)['bytes']
         self._tmpfiles[path]['cksum'] = cksum
+
+
+    ######
+    ######
+    ## UID<->user, GID<->group lookup methods.
+    ##
+    ## TODO: memoize
 
     def _gid(self, group):
         try:
