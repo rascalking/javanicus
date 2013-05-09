@@ -687,10 +687,11 @@ if __name__ == '__main__':
     parser.add_argument('port')
     parser.add_argument('mountpoint')
     parser.add_argument('--debug', action='store_true', default=False)
+    parser.add_argument('--foreground', action='store_true', default=False)
     args = parser.parse_args()
 
     fs = fuse.FUSE(Javanicus(args.host, args.port, args.mountpoint, args.debug),
                    args.mountpoint,
-                   foreground=True,
+                   foreground=args.foreground,
                    nothreads=True,
-            )#debug=args.debug)
+                   debug=args.debug)
