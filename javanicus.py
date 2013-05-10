@@ -684,21 +684,27 @@ class Javanicus(fuse.Operations):
         return len(data)
 
 
-if __name__ == '__main__':
+def main():
     import logging
     logging.basicConfig()
 
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument('host')
-    parser.add_argument('port')
-    parser.add_argument('mountpoint')
+    parser.add_argument('--port', type=int, default=50070)
+    parser.add_argument('mount')
     parser.add_argument('--debug', action='store_true', default=False)
     parser.add_argument('--foreground', action='store_true', default=False)
     args = parser.parse_args()
 
-    fs = fuse.FUSE(Javanicus(args.host, args.port, args.mountpoint, args.debug),
-                   args.mountpoint,
+    javanicus = Javanicus(args.host, args.port, args.mount, args.debug)
+    fs = fuse.FUSE(javanicus,
+                   args.mount,
                    foreground=args.foreground,
                    nothreads=True,
                    debug=args.debug)
+    return 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())
